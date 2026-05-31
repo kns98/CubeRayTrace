@@ -1,0 +1,654 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+    <title>Progressive Ray Tracer - Rotating Cube Demo</title>
+    <style>
+        * {
+            user-select: none;
+        }
+        body {
+            margin: 0;
+            overflow: hidden;
+            font-family: 'Segoe UI', 'Roboto', monospace;
+            background: #0a0c12;
+        }
+        #ui {
+            position: absolute;
+            top: 16px;
+            left: 16px;
+            right: 16px;
+            display: flex;
+            flex-wrap: wrap;
+            gap: 12px;
+            justify-content: space-between;
+            pointer-events: none;
+            z-index: 20;
+        }
+        .panel {
+            background: rgba(20, 22, 32, 0.85);
+            backdrop-filter: blur(8px);
+            border-radius: 14px;
+            padding: 10px 18px;
+            color: #f0f3fa;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 13px;
+            font-weight: 500;
+            border: 1px solid rgba(255,200,100,0.25);
+            box-shadow: 0 4px 15px rgba(0,0,0,0.4);
+            pointer-events: none;
+        }
+        .panel button {
+            pointer-events: auto;
+            background: #2a2e3f;
+            border: none;
+            color: #ffdd99;
+            font-family: monospace;
+            padding: 4px 12px;
+            border-radius: 30px;
+            cursor: pointer;
+            font-size: 12px;
+            margin-left: 12px;
+            transition: 0.2s;
+        }
+        .panel button:hover {
+            background: #5f4c2b;
+            color: white;
+            box-shadow: 0 0 8px #ffaa66;
+        }
+        #stats {
+            background: rgba(0,0,0,0.7);
+            font-family: monospace;
+            font-size: 12px;
+            border-left: 3px solid #ffaa66;
+        }
+        #controls {
+            display: flex;
+            gap: 8px;
+            background: rgba(0,0,0,0.6);
+            border-radius: 40px;
+            padding: 6px 14px;
+            backdrop-filter: blur(5px);
+        }
+        .badge {
+            background: #ffaa3322;
+            border-radius: 20px;
+            padding: 2px 10px;
+            font-size: 11px;
+        }
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: grab;
+        }
+        canvas:active { cursor: grabbing; }
+        @keyframes pulse {
+            0% { opacity: 0.6; }
+            100% { opacity: 1; }
+        }
+        .progress-dot {
+            display: inline-block;
+            width: 10px;
+            height: 10px;
+            background: #88ff88;
+            border-radius: 10px;
+            margin-right: 6px;
+            animation: pulse 1s infinite;
+        }
+        #rotationToggle {
+            background: #3a2e3f;
+            margin-left: 8px;
+        }
+        #rotationToggle.rotating {
+            background: #5f4c2b;
+            color: #ffffaa;
+            box-shadow: 0 0 6px #ffaa66;
+        }
+    </style>
+</head>
+<body>
+<div id="ui">
+    <div class="panel">
+        🧊 <strong>Progressive Ray Tracer</strong> · Diffuse GI + Cube Scene
+        <span style="font-size:11px; margin-left:8px;">🌍 cosine‑weighted sampling | RR | BVH</span>
+    </div>
+    <div id="controls">
+        <div class="panel" id="stats">
+            <span id="sampleCounter">📸 samples/pixel: 0</span> &nbsp;|&nbsp;
+            <span id="timer">⏱️ 0.0 s</span> &nbsp;|&nbsp;
+            <span id="rays">✨ rays: 0</span>
+        </div>
+        <div class="panel" style="pointer-events:auto">
+            <button id="saveBtn">💾 Save PPM</button>
+            <button id="resetBtn">🔄 Restart</button>
+            <button id="rotateBtn" style="background:#3a2e3f;">🔄 Auto Rotate</button>
+        </div>
+    </div>
+</div>
+<div style="position: absolute; bottom: 14px; right: 14px; background: #000000aa; border-radius: 20px; padding: 4px 12px; font-size: 11px; color: #ccc; pointer-events: none;">
+    🖱️ drag to rotate · scroll zoom · cube rotates automatically
+</div>
+<canvas id="rayCanvas"></canvas>
+
+<script>
+    (function(){
+        // ---------- VECTOR3 (double precision) ----------
+        class Vec3 {
+            constructor(x,y,z) { this.x=x||0; this.y=y||0; this.z=z||0; }
+            add(v) { return new Vec3(this.x+v.x, this.y+v.y, this.z+v.z); }
+            sub(v) { return new Vec3(this.x-v.x, this.y-v.y, this.z-v.z); }
+            mul(s) { return (typeof s === 'number') ? new Vec3(this.x*s, this.y*s, this.z*s) : new Vec3(this.x*s.x, this.y*s.y, this.z*s.z); }
+            div(s) { return new Vec3(this.x/s, this.y/s, this.z/s); }
+            dot(v) { return this.x*v.x + this.y*v.y + this.z*v.z; }
+            cross(v) { return new Vec3(this.y*v.z - this.z*v.y, this.z*v.x - this.x*v.z, this.x*v.y - this.y*v.x); }
+            length() { return Math.sqrt(this.x*this.x+this.y*this.y+this.z*this.z); }
+            normalize() { const l=this.length(); if(l<1e-8) return new Vec3(0,0,0); return new Vec3(this.x/l, this.y/l, this.z/l); }
+            clone() { return new Vec3(this.x,this.y,this.z); }
+            static zero() { return new Vec3(0,0,0); }
+        }
+        
+        function reflect(incident, normal) { return incident.sub(normal.mul(2*incident.dot(normal))); }
+        
+        // ---------- Material ----------
+        class Material {
+            constructor(color, reflectivity, emittance) {
+                this.color = color;      // diffuse color
+                this.reflectivity = reflectivity; // albedo magnitude (0..1)
+                this.emittance = emittance;       // emitted radiance
+            }
+        }
+        
+        // ---------- Triangle (with precomputed edge & normal) ----------
+        class Triangle {
+            constructor(v0, v1, v2, material) {
+                this.v0=v0; this.v1=v1; this.v2=v2;
+                this.mat = material;
+                const e1 = v1.sub(v0);
+                const e2 = v2.sub(v0);
+                this.normal = e1.cross(e2).normalize();
+                this.minX = Math.min(v0.x,v1.x,v2.x);
+                this.minY = Math.min(v0.y,v1.y,v2.y);
+                this.minZ = Math.min(v0.z,v1.z,v2.z);
+                this.maxX = Math.max(v0.x,v1.x,v2.x);
+                this.maxY = Math.max(v0.y,v1.y,v2.y);
+                this.maxZ = Math.max(v0.z,v1.z,v2.z);
+            }
+            intersect(ray, tMin, tMax, hit) {
+                const EPS = 1e-8;
+                const e1 = this.v1.sub(this.v0);
+                const e2 = this.v2.sub(this.v0);
+                const h = ray.dir.cross(e2);
+                const a = e1.dot(h);
+                if(Math.abs(a) < EPS) return false;
+                const f = 1.0 / a;
+                const s = ray.orig.sub(this.v0);
+                const u = f * s.dot(h);
+                if(u < 0 || u > 1) return false;
+                const q = s.cross(e1);
+                const v = f * ray.dir.dot(q);
+                if(v < 0 || u+v > 1) return false;
+                const t = f * e2.dot(q);
+                if(t > EPS && t < tMax && t > tMin) {
+                    hit.t = t;
+                    hit.triangle = this;
+                    return true;
+                }
+                return false;
+            }
+        }
+        
+        // ---------- BVH Node ----------
+        class BVHNode {
+            constructor(triangles, start, end) {
+                if(end - start === 1) {
+                    this.left = this.right = null;
+                    this.tri = triangles[start];
+                    const b = this.tri;
+                    this.minX = b.minX; this.maxX = b.maxX;
+                    this.minY = b.minY; this.maxY = b.maxY;
+                    this.minZ = b.minZ; this.maxZ = b.maxZ;
+                    return;
+                }
+                let minC = new Vec3(1e9,1e9,1e9), maxC = new Vec3(-1e9,-1e9,-1e9);
+                for(let i=start; i<end; i++) {
+                    const c = triangles[i].v0.add(triangles[i].v1).add(triangles[i].v2).mul(1/3);
+                    minC = new Vec3(Math.min(minC.x,c.x), Math.min(minC.y,c.y), Math.min(minC.z,c.z));
+                    maxC = new Vec3(Math.max(maxC.x,c.x), Math.max(maxC.y,c.y), Math.max(maxC.z,c.z));
+                }
+                const ext = new Vec3(maxC.x-minC.x, maxC.y-minC.y, maxC.z-minC.z);
+                let axis = 0;
+                if(ext.y > ext.x && ext.y > ext.z) axis=1;
+                if(ext.z > ext.x && ext.z > ext.y) axis=2;
+                triangles.sort((a,b) => {
+                    const ca = a.v0.add(a.v1).add(a.v2).mul(1/3);
+                    const cb = b.v0.add(b.v1).add(b.v2).mul(1/3);
+                    return ca.get(axis) - cb.get(axis);
+                });
+                const mid = start + Math.floor((end-start)/2);
+                this.left = new BVHNode(triangles, start, mid);
+                this.right = new BVHNode(triangles, mid, end);
+                this.tri = null;
+                this.minX = Math.min(this.left.minX, this.right.minX);
+                this.minY = Math.min(this.left.minY, this.right.minY);
+                this.minZ = Math.min(this.left.minZ, this.right.minZ);
+                this.maxX = Math.max(this.left.maxX, this.right.maxX);
+                this.maxY = Math.max(this.left.maxY, this.right.maxY);
+                this.maxZ = Math.max(this.left.maxZ, this.right.maxZ);
+            }
+            
+            intersect(ray, tMin, tMax, hit) {
+                let t0x = (this.minX - ray.orig.x) * ray.invDir.x;
+                let t1x = (this.maxX - ray.orig.x) * ray.invDir.x;
+                let t0y = (this.minY - ray.orig.y) * ray.invDir.y;
+                let t1y = (this.maxY - ray.orig.y) * ray.invDir.y;
+                let t0z = (this.minZ - ray.orig.z) * ray.invDir.z;
+                let t1z = (this.maxZ - ray.orig.z) * ray.invDir.z;
+                if(ray.invDir.x < 0) { let tmp=t0x; t0x=t1x; t1x=tmp; }
+                if(ray.invDir.y < 0) { let tmp=t0y; t0y=t1y; t1y=tmp; }
+                if(ray.invDir.z < 0) { let tmp=t0z; t0z=t1z; t1z=tmp; }
+                const tEnter = Math.max(t0x,t0y,t0z);
+                const tExit = Math.min(t1x,t1y,t1z);
+                if(tEnter > tExit || tExit < tMin) return false;
+                
+                if(this.tri !== null) {
+                    return this.tri.intersect(ray, tMin, tMax, hit);
+                }
+                const leftHit = { t:1e9, triangle:null };
+                const rightHit = { t:1e9, triangle:null };
+                let hitLeft=false, hitRight=false;
+                if(this.left) hitLeft = this.left.intersect(ray, tMin, tMax, leftHit);
+                if(this.right) hitRight = this.right.intersect(ray, tMin, tMax, rightHit);
+                if(hitLeft && leftHit.t < tMax && (!hitRight || leftHit.t < rightHit.t)) {
+                    hit.t = leftHit.t; hit.triangle = leftHit.triangle; return true;
+                }
+                if(hitRight && rightHit.t < tMax) {
+                    hit.t = rightHit.t; hit.triangle = rightHit.triangle; return true;
+                }
+                return false;
+            }
+        }
+        
+        Vec3.prototype.get = function(axis) { return axis===0?this.x:(axis===1?this.y:this.z); };
+        
+        class Scene {
+            constructor() {
+                this.triangles = [];
+                this.lights = [];
+                this.bvh = null;
+            }
+            addTriangle(tri) {
+                this.triangles.push(tri);
+                if(tri.mat.emittance > 0) this.lights.push(tri);
+            }
+            build() {
+                if(this.triangles.length) this.bvh = new BVHNode(this.triangles, 0, this.triangles.length);
+            }
+            intersect(ray, tMin, tMax, hit) {
+                if(!this.bvh) return false;
+                return this.bvh.intersect(ray, tMin, tMax, hit);
+            }
+            getEmitters() { return this.lights; }
+        }
+        
+        // ---------- Build a colorful cube + surrounding scene (house-like environment with soft lighting) ----------
+        function buildCubeScene() {
+            const scene = new Scene();
+            
+            // Cube materials: each face gets a different vibrant diffuse color
+            const redMat   = new Material(new Vec3(0.95, 0.25, 0.25), 0.72, 0.0);
+            const greenMat = new Material(new Vec3(0.25, 0.85, 0.35), 0.72, 0.0);
+            const blueMat  = new Material(new Vec3(0.25, 0.45, 0.95), 0.72, 0.0);
+            const yellowMat= new Material(new Vec3(0.95, 0.85, 0.25), 0.72, 0.0);
+            const cyanMat  = new Material(new Vec3(0.25, 0.85, 0.85), 0.72, 0.0);
+            const magentaMat= new Material(new Vec3(0.90, 0.35, 0.90), 0.72, 0.0);
+            
+            // Cube centered at (0, 0.2, 3.0) with size 1.0
+            const s = 0.55; // half-size approx to make cube prominent
+            const cx = 0.0, cy = 0.2, cz = 3.0;
+            
+            // Define 8 vertices
+            const v0 = new Vec3(cx-s, cy-s, cz-s); // front-bottom-left
+            const v1 = new Vec3(cx+s, cy-s, cz-s); // front-bottom-right
+            const v2 = new Vec3(cx+s, cy+s, cz-s); // front-top-right
+            const v3 = new Vec3(cx-s, cy+s, cz-s); // front-top-left
+            const v4 = new Vec3(cx-s, cy-s, cz+s); // back-bottom-left
+            const v5 = new Vec3(cx+s, cy-s, cz+s); // back-bottom-right
+            const v6 = new Vec3(cx+s, cy+s, cz+s); // back-top-right
+            const v7 = new Vec3(cx-s, cy+s, cz+s); // back-top-left
+            
+            // Front face (z = cz-s) - Red
+            scene.addTriangle(new Triangle(v0, v1, v2, redMat));
+            scene.addTriangle(new Triangle(v0, v2, v3, redMat));
+            // Back face (z = cz+s) - Cyan
+            scene.addTriangle(new Triangle(v5, v4, v7, cyanMat));
+            scene.addTriangle(new Triangle(v5, v7, v6, cyanMat));
+            // Left face (x = cx-s) - Green
+            scene.addTriangle(new Triangle(v4, v0, v3, greenMat));
+            scene.addTriangle(new Triangle(v4, v3, v7, greenMat));
+            // Right face (x = cx+s) - Blue
+            scene.addTriangle(new Triangle(v1, v5, v6, blueMat));
+            scene.addTriangle(new Triangle(v1, v6, v2, blueMat));
+            // Top face (y = cy+s) - Yellow
+            scene.addTriangle(new Triangle(v3, v2, v6, yellowMat));
+            scene.addTriangle(new Triangle(v3, v6, v7, yellowMat));
+            // Bottom face (y = cy-s) - Magenta
+            scene.addTriangle(new Triangle(v0, v4, v5, magentaMat));
+            scene.addTriangle(new Triangle(v0, v5, v1, magentaMat));
+            
+            // --- Environment: ground plane and backdrop to give sense of space and GI ---
+            const groundMat = new Material(new Vec3(0.55, 0.48, 0.42), 0.58, 0.0);
+            scene.addTriangle(new Triangle(new Vec3(-3.5, -0.45, 1.0), new Vec3(3.5, -0.45, 1.0), new Vec3(3.5, -0.45, 5.5), groundMat));
+            scene.addTriangle(new Triangle(new Vec3(-3.5, -0.45, 1.0), new Vec3(3.5, -0.45, 5.5), new Vec3(-3.5, -0.45, 5.5), groundMat));
+            
+            // Back wall: warm tone
+            const backMat = new Material(new Vec3(0.68, 0.54, 0.46), 0.62, 0.0);
+            scene.addTriangle(new Triangle(new Vec3(-2.2, -0.4, 4.5), new Vec3(2.2, -0.4, 4.5), new Vec3(2.2, 1.8, 4.5), backMat));
+            scene.addTriangle(new Triangle(new Vec3(-2.2, -0.4, 4.5), new Vec3(2.2, 1.8, 4.5), new Vec3(-2.2, 1.8, 4.5), backMat));
+            
+            // Ceiling light panel (emitter) - soft area light above cube
+            const emitterMat = new Material(new Vec3(1.0, 0.98, 0.92), 0.0, 9.5);
+            scene.addTriangle(new Triangle(new Vec3(-1.2, 1.45, 2.5), new Vec3(1.2, 1.45, 2.5), new Vec3(1.2, 1.45, 3.9), emitterMat));
+            scene.addTriangle(new Triangle(new Vec3(-1.2, 1.45, 2.5), new Vec3(1.2, 1.45, 3.9), new Vec3(-1.2, 1.45, 3.9), emitterMat));
+            
+            // Additional fill light: small glowing panel on side for interesting shadows
+            const fillMat = new Material(new Vec3(0.9, 0.7, 0.5), 0.0, 3.2);
+            scene.addTriangle(new Triangle(new Vec3(-1.8, 0.3, 2.2), new Vec3(-1.4, 0.3, 2.2), new Vec3(-1.4, 0.8, 2.2), fillMat));
+            scene.addTriangle(new Triangle(new Vec3(-1.8, 0.3, 2.2), new Vec3(-1.4, 0.8, 2.2), new Vec3(-1.8, 0.8, 2.2), fillMat));
+            
+            // Simple side columns to reflect light
+            const pillarMat = new Material(new Vec3(0.7, 0.65, 0.6), 0.5, 0.0);
+            scene.addTriangle(new Triangle(new Vec3(-1.6, -0.4, 2.0), new Vec3(-1.2, -0.4, 2.0), new Vec3(-1.2, 1.2, 2.0), pillarMat));
+            scene.addTriangle(new Triangle(new Vec3(-1.6, -0.4, 2.0), new Vec3(-1.2, 1.2, 2.0), new Vec3(-1.6, 1.2, 2.0), pillarMat));
+            scene.addTriangle(new Triangle(new Vec3(1.2, -0.4, 2.0), new Vec3(1.6, -0.4, 2.0), new Vec3(1.6, 1.2, 2.0), pillarMat));
+            scene.addTriangle(new Triangle(new Vec3(1.2, -0.4, 2.0), new Vec3(1.6, 1.2, 2.0), new Vec3(1.2, 1.2, 2.0), pillarMat));
+            
+            scene.build();
+            return scene;
+        }
+        
+        // ---------- Path Tracer with emitter sampling and indirect diffuse ----------
+        class PathTracer {
+            constructor(scene, maxDepth=5) {
+                this.scene = scene;
+                this.maxDepth = maxDepth;
+                this.emitters = scene.getEmitters();
+                this.emitterCount = this.emitters.length;
+            }
+            
+            sampleEmitter(rng) {
+                if(this.emitterCount===0) return null;
+                const idx = Math.floor(rng() * this.emitterCount);
+                const tri = this.emitters[idx];
+                const u = Math.sqrt(rng());
+                const v = rng();
+                const p = tri.v0.add(tri.v1.sub(tri.v0).mul(u)).add(tri.v2.sub(tri.v0).mul(v*(1-u)));
+                const normal = tri.normal;
+                const area = tri.v1.sub(tri.v0).cross(tri.v2.sub(tri.v0)).length() * 0.5;
+                return {point: p, normal: normal, emittance: tri.mat.emittance, area: area, tri: tri};
+            }
+            
+            cosineSampleHemisphere(normal, rng) {
+                const r1 = rng(), r2 = rng();
+                const theta = 2*Math.PI*r1;
+                const phi = Math.acos(Math.sqrt(r2));
+                const x = Math.sin(phi)*Math.cos(theta);
+                const y = Math.sin(phi)*Math.sin(theta);
+                const z = Math.cos(phi);
+                let dir = new Vec3(x,y,z).normalize();
+                if(dir.dot(normal) < 0) dir = dir.mul(-1);
+                return dir;
+            }
+            
+            radiance(ray, rng, depth=0) {
+                const hit = { t: 1e9, triangle: null };
+                if(!this.scene.intersect(ray, 0.001, 1e9, hit)) {
+                    // gradient sky/background
+                    const t = 0.5*(ray.dir.y+1.0);
+                    return new Vec3(0.42, 0.58, 0.85).mul(1-t).add(new Vec3(0.96,0.94,1.0).mul(t));
+                }
+                const tri = hit.triangle;
+                const mat = tri.mat;
+                const point = ray.orig.add(ray.dir.mul(hit.t));
+                const normal = tri.normal;
+                const frontFace = ray.dir.dot(normal) < 0;
+                const shadeNormal = frontFace ? normal : normal.mul(-1);
+                
+                let L = mat.emittance > 0 ? mat.color.mul(mat.emittance) : Vec3.zero();
+                
+                // Direct lighting from emitters
+                let direct = Vec3.zero();
+                if(this.emitterCount > 0 && mat.reflectivity > 0) {
+                    const emitterSample = this.sampleEmitter(rng);
+                    if(emitterSample) {
+                        const toLight = emitterSample.point.sub(point);
+                        const dist2 = toLight.dot(toLight);
+                        const lightDir = toLight.normalize();
+                        const cosThetaLight = Math.max(0, shadeNormal.dot(lightDir));
+                        const cosThetaEmitter = Math.max(0, emitterSample.normal.dot(lightDir.mul(-1)));
+                        if(cosThetaLight > 1e-4 && cosThetaEmitter > 1e-4) {
+                            const shadowRay = new Ray(point.add(shadeNormal.mul(0.003)), lightDir);
+                            const shadowHit = { t:1e9 };
+                            const occluded = this.scene.intersect(shadowRay, 0.001, Math.sqrt(dist2)-0.002, shadowHit);
+                            if(!occluded) {
+                                const solidAngle = cosThetaEmitter / (dist2 * Math.PI);
+                                const emittedRadiance = emitterSample.emittance * solidAngle * (1.0 / this.emitterCount);
+                                const brdf = mat.color.mul(1/Math.PI);
+                                direct = direct.add(brdf.mul(cosThetaLight * emittedRadiance));
+                            }
+                        }
+                    }
+                }
+                
+                // Indirect diffuse with Russian Roulette
+                let indirect = Vec3.zero();
+                if(depth < this.maxDepth && mat.reflectivity > 0) {
+                    const rrProb = Math.min(0.95, mat.reflectivity);
+                    if(rng() < rrProb) {
+                        const newDir = this.cosineSampleHemisphere(shadeNormal, rng);
+                        const bounceRay = new Ray(point.add(shadeNormal.mul(0.003)), newDir);
+                        const bounceRad = this.radiance(bounceRay, rng, depth+1);
+                        const scale = mat.color.mul(1.0 / rrProb);
+                        indirect = bounceRad.mul(scale);
+                    }
+                }
+                
+                L = L.add(direct).add(indirect);
+                return new Vec3(Math.min(3.2, L.x), Math.min(3.2, L.y), Math.min(3.2, L.z));
+            }
+        }
+        
+        class Ray { constructor(orig,dir) { this.orig=orig; this.dir=dir.normalize(); this.invDir = new Vec3(1/this.dir.x, 1/this.dir.y, 1/this.dir.z); } }
+        
+        // ---------- Camera with orbit and auto-rotation ----------
+        class Camera {
+            constructor(pos, target, up, fovDeg) {
+                this.pos=pos; this.target=target; this.up=up.normalize(); this.fovRad=fovDeg*Math.PI/180;
+                this.update();
+            }
+            update() {
+                this.dir = this.target.sub(this.pos).normalize();
+                this.right = this.up.cross(this.dir).normalize();
+                this.upActual = this.dir.cross(this.right).normalize();
+            }
+            getRay(u, v, aspect) {
+                const halfTan = Math.tan(this.fovRad*0.5);
+                const sx = (2*u-1)*halfTan*aspect;
+                const sy = (1-2*v)*halfTan;
+                const dir = this.right.mul(sx).add(this.upActual.mul(sy)).add(this.dir).normalize();
+                return new Ray(this.pos, dir);
+            }
+        }
+        
+        // ---------- Progressive Renderer with auto-rotate ----------
+        let canvas = document.getElementById('rayCanvas');
+        let ctx = canvas.getContext('2d');
+        let width=0, height=0;
+        let scene = buildCubeScene();
+        let tracer = new PathTracer(scene, 4);
+        let camera;
+        let accum = null;
+        let samples = 0;
+        let startTime = 0;
+        let animFrame = null;
+        let totalRays = 0;
+        let needsReset = true;
+        
+        // camera control
+        let isDragging=false, lastX=0, lastY=0;
+        let theta = 1.05, phi = 0.95, radius = 5.6;
+        let autoRotate = true;
+        let lastAutoTime = 0;
+        const center = new Vec3(0, 0.25, 3.0);
+        
+        function updateCamera() {
+            const x = radius * Math.sin(theta) * Math.cos(phi);
+            const z = radius * Math.sin(theta) * Math.sin(phi);
+            const y = radius * Math.cos(theta) + 0.25;
+            camera.pos = new Vec3(x, y, z + 2.0);
+            camera.target = center;
+            camera.update();
+        }
+        
+        function resetAccum() {
+            if(!width || !height) return;
+            accum = new Array(width*height);
+            for(let i=0;i<width*height;i++) accum[i]=new Vec3(0,0,0);
+            samples=0;
+            totalRays=0;
+            document.getElementById('sampleCounter').innerHTML = `📸 samples/pixel: 0`;
+        }
+        
+        function renderFrame(now) {
+            if(!width || !height || !camera || !tracer) return;
+            
+            // Auto-rotate logic: smoothly rotate phi over time
+            if(autoRotate && !isDragging) {
+                const delta = Math.min(0.033, (now - lastAutoTime) / 1000);
+                if(delta > 0) {
+                    phi += delta * 0.85; // rotation speed
+                    // keep phi manageable
+                    if(phi > Math.PI*2) phi -= Math.PI*2;
+                    updateCamera();
+                    needsReset = true;
+                }
+                lastAutoTime = now;
+            }
+            
+            if(needsReset) { resetAccum(); needsReset=false; startTime=performance.now(); lastAutoTime = now; }
+            
+            const aspect = width/height;
+            const rng = Math.random;
+            let frameRays = 0;
+            for(let y=0; y<height; y++) {
+                for(let x=0; x<width; x++) {
+                    const idx = y*width + x;
+                    let col = new Vec3(0,0,0);
+                    const u = (x + rng())/width;
+                    const v = (y + rng())/height;
+                    const ray = camera.getRay(u, v, aspect);
+                    const rad = tracer.radiance(ray, rng, 0);
+                    col = col.add(rad);
+                    frameRays++;
+                    const old = accum[idx];
+                    accum[idx] = new Vec3(old.x+col.x, old.y+col.y, old.z+col.z);
+                }
+            }
+            totalRays += frameRays;
+            samples++;
+            const invSamples = 1.0/samples;
+            const imgData = ctx.createImageData(width, height);
+            for(let y=0; y<height; y++) {
+                for(let x=0; x<width; x++) {
+                    const idx = y*width + x;
+                    let c = accum[idx];
+                    let r = c.x*invSamples, g=c.y*invSamples, b=c.z*invSamples;
+                    // Reinhard tone mapping + gamma
+                    const L = 0.2126*r + 0.7152*g + 0.0722*b;
+                    const scale = 1.0/(1.0 + L);
+                    r = Math.pow(r*scale, 1/2.2);
+                    g = Math.pow(g*scale, 1/2.2);
+                    b = Math.pow(b*scale, 1/2.2);
+                    const off = (y*width + x)*4;
+                    imgData.data[off]=Math.min(255, Math.floor(r*255));
+                    imgData.data[off+1]=Math.min(255, Math.floor(g*255));
+                    imgData.data[off+2]=Math.min(255, Math.floor(b*255));
+                    imgData.data[off+3]=255;
+                }
+            }
+            ctx.putImageData(imgData,0,0);
+            const elapsed = (performance.now()-startTime)/1000;
+            document.getElementById('sampleCounter').innerHTML = `📸 samples/pixel: ${samples}`;
+            document.getElementById('timer').innerHTML = `⏱️ ${elapsed.toFixed(1)} s`;
+            document.getElementById('rays').innerHTML = `✨ rays: ${(totalRays/1e6).toFixed(2)}M`;
+            animFrame = requestAnimationFrame(renderFrame);
+        }
+        
+        function resizeAndRestart() {
+            width = window.innerWidth; height = window.innerHeight;
+            canvas.width = width; canvas.height = height;
+            needsReset = true;
+        }
+        
+        // UI & interaction
+        window.addEventListener('resize', ()=>{ resizeAndRestart(); });
+        canvas.addEventListener('mousedown',(e)=>{ isDragging=true; lastX=e.clientX; lastY=e.clientY; canvas.style.cursor='grabbing'; });
+        window.addEventListener('mousemove',(e)=>{
+            if(!isDragging) return;
+            const dx=e.clientX-lastX, dy=e.clientY-lastY;
+            if(dx!==0||dy!==0){ phi+=dx*0.008; theta+=dy*0.008; theta=Math.min(Math.PI-0.2, Math.max(0.2, theta)); updateCamera(); needsReset=true; }
+            lastX=e.clientX; lastY=e.clientY;
+        });
+        window.addEventListener('mouseup',()=>{ isDragging=false; canvas.style.cursor='grab'; });
+        canvas.addEventListener('wheel',(e)=>{
+            e.preventDefault(); radius -= e.deltaY*0.008; radius=Math.min(9, Math.max(3.2, radius)); updateCamera(); needsReset=true;
+        },{passive:false});
+        
+        document.getElementById('resetBtn').addEventListener('click',()=>{ needsReset=true; });
+        document.getElementById('saveBtn').addEventListener('click',()=>{
+            if(!accum || samples===0) return;
+            const inv = 1.0/samples;
+            let ppm = `P6\n${width} ${height}\n255\n`;
+            const buf = [];
+            for(let y=0;y<height;y++){
+                for(let x=0;x<width;x++){
+                    const c=accum[y*width+x];
+                    let r=c.x*inv, g=c.y*inv, b=c.z*inv;
+                    const L=0.2126*r+0.7152*g+0.0722*b;
+                    const scale=1/(1+L);
+                    r=Math.pow(r*scale,1/2.2); g=Math.pow(g*scale,1/2.2); b=Math.pow(b*scale,1/2.2);
+                    buf.push(Math.min(255,Math.floor(r*255)), Math.min(255,Math.floor(g*255)), Math.min(255,Math.floor(b*255)));
+                }
+            }
+            const blob=new Blob([ppm, new Uint8Array(buf)], {type:"image/x-portable-pixmap"});
+            const a=document.createElement('a'); a.href=URL.createObjectURL(blob); a.download=`cube_render_${samples}samples.ppm`; a.click(); URL.revokeObjectURL(a.href);
+        });
+        
+        const rotateBtn = document.getElementById('rotateBtn');
+        rotateBtn.addEventListener('click', () => {
+            autoRotate = !autoRotate;
+            if(autoRotate) {
+                rotateBtn.textContent = '⏸️ Auto Rotate';
+                rotateBtn.style.background = '#5f4c2b';
+                lastAutoTime = performance.now();
+            } else {
+                rotateBtn.textContent = '🔄 Auto Rotate';
+                rotateBtn.style.background = '#3a2e3f';
+            }
+        });
+        rotateBtn.textContent = autoRotate ? '⏸️ Auto Rotate' : '🔄 Auto Rotate';
+        rotateBtn.style.background = autoRotate ? '#5f4c2b' : '#3a2e3f';
+        
+        function init() {
+            camera = new Camera(new Vec3(0,0.5,5), center, new Vec3(0,1,0), 56);
+            theta=1.05; phi=0.95; radius=5.6; updateCamera();
+            resizeAndRestart();
+            lastAutoTime = performance.now();
+            renderFrame(lastAutoTime);
+        }
+        init();
+    })();
+</script>
+</body>
+</html>
