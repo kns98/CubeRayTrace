@@ -1,0 +1,745 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Ray-Traced Room Lighting Showcase</title>
+  <style>
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #040404;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+      cursor: grab;
+    }
+
+    canvas:active {
+      cursor: grabbing;
+    }
+
+    #panel {
+      position: fixed;
+      left: 14px;
+      top: 14px;
+      z-index: 2;
+      color: rgba(255, 255, 255, 0.96);
+      background: rgba(0, 0, 0, 0.56);
+      border: 1px solid rgba(255, 255, 255, 0.16);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 13px;
+      line-height: 1.45;
+      user-select: none;
+      min-width: 300px;
+      backdrop-filter: blur(4px);
+    }
+
+    #panel .title {
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    #panel .row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 8px;
+      flex-wrap: wrap;
+    }
+
+    #panel button,
+    #panel select {
+      background: rgba(255, 255, 255, 0.12);
+      color: white;
+      border: 1px solid rgba(255, 255, 255, 0.18);
+      border-radius: 8px;
+      padding: 6px 9px;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    #panel button:hover,
+    #panel select:hover {
+      background: rgba(255, 255, 255, 0.20);
+    }
+
+    #status, #lightingStatus {
+      color: rgba(255, 255, 255, 0.80);
+      margin-top: 8px;
+      font-size: 12px;
+      white-space: pre-line;
+    }
+  </style>
+</head>
+<body>
+<canvas id="canvas"></canvas>
+<div id="panel">
+  <div class="title">Lighting showcase</div>
+  This version highlights the room's lighting with lights off/on states and progressive dimming/brightening while the camera follows a cinematic path.
+
+  <div class="row">
+    <button id="playPauseBtn">Pause demo</button>
+    <button id="restartBtn">Restart</button>
+    <button id="manualBtn">Manual camera</button>
+    <button id="demoBtn">Demo camera</button>
+  </div>
+
+  <div class="row">
+    <label for="scaleSelect">Render scale:</label>
+    <select id="scaleSelect">
+      <option value="0.25">25%</option>
+      <option value="0.33">33%</option>
+      <option value="0.5" selected>50%</option>
+      <option value="0.67">67%</option>
+      <option value="1">100%</option>
+    </select>
+  </div>
+
+  <div style="margin-top:8px;">
+    Keyboard: F play/pause demo, T restart, M manual camera, P demo camera, W/A/S/D move, Q/E down/up, drag mouse to look, R reset manual camera, - / = lower or raise render scale.
+  </div>
+
+  <div id="status"></div>
+  <div id="lightingStatus"></div>
+</div>
+
+<script>
+class Vec3 {
+  constructor(x = 0, y = 0, z = 0) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+  }
+  add(v) { return new Vec3(this.x + v.x, this.y + v.y, this.z + v.z); }
+  sub(v) { return new Vec3(this.x - v.x, this.y - v.y, this.z - v.z); }
+  mul(s) { return new Vec3(this.x * s, this.y * s, this.z * s); }
+  div(s) { return new Vec3(this.x / s, this.y / s, this.z / s); }
+  mulVec(v) { return new Vec3(this.x * v.x, this.y * v.y, this.z * v.z); }
+  dot(v) { return this.x * v.x + this.y * v.y + this.z * v.z; }
+  cross(v) {
+    return new Vec3(
+      this.y * v.z - this.z * v.y,
+      this.z * v.x - this.x * v.z,
+      this.x * v.y - this.y * v.x
+    );
+  }
+  length() { return Math.sqrt(this.dot(this)); }
+  normalize() {
+    const len = this.length();
+    if (len < 1e-8) return new Vec3(0, 0, 0);
+    return this.div(len);
+  }
+}
+
+class Ray {
+  constructor(origin, direction) {
+    this.origin = origin;
+    this.direction = direction.normalize();
+  }
+}
+
+class Material {
+  constructor(color, emission = 0, lightId = null) {
+    this.color = color;
+    this.emission = emission;
+    this.lightId = lightId;
+  }
+}
+
+class Triangle {
+  constructor(a, b, c, material) {
+    this.a = a;
+    this.b = b;
+    this.c = c;
+    this.material = material;
+    this.normal = b.sub(a).cross(c.sub(a)).normalize();
+  }
+
+  intersect(ray) {
+    const EPS = 1e-6;
+    const edge1 = this.b.sub(this.a);
+    const edge2 = this.c.sub(this.a);
+    const h = ray.direction.cross(edge2);
+    const det = edge1.dot(h);
+    if (Math.abs(det) < EPS) return null;
+
+    const invDet = 1 / det;
+    const s = ray.origin.sub(this.a);
+    const u = invDet * s.dot(h);
+    if (u < 0 || u > 1) return null;
+
+    const q = s.cross(edge1);
+    const v = invDet * ray.direction.dot(q);
+    if (v < 0 || u + v > 1) return null;
+
+    const t = invDet * edge2.dot(q);
+    if (t < EPS) return null;
+
+    return {
+      t,
+      point: ray.origin.add(ray.direction.mul(t)),
+      normal: this.normal,
+      material: this.material
+    };
+  }
+}
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d", { alpha: false });
+ctx.imageSmoothingEnabled = true;
+
+const playPauseBtn = document.getElementById("playPauseBtn");
+const restartBtn = document.getElementById("restartBtn");
+const manualBtn = document.getElementById("manualBtn");
+const demoBtn = document.getElementById("demoBtn");
+const scaleSelect = document.getElementById("scaleSelect");
+const statusEl = document.getElementById("status");
+const lightingStatusEl = document.getElementById("lightingStatus");
+
+let width = 1;
+let height = 1;
+let imageData;
+let pixels;
+let renderScale = 0.5;
+const allowedScales = [0.25, 0.33, 0.5, 0.67, 1.0];
+
+const tris = [];
+
+const whiteWall = new Material(new Vec3(0.78, 0.76, 0.72));
+const redWall = new Material(new Vec3(0.75, 0.18, 0.14));
+const blueWall = new Material(new Vec3(0.16, 0.28, 0.75));
+const floorMat = new Material(new Vec3(0.55, 0.50, 0.43));
+const ceilingMat = new Material(new Vec3(0.72, 0.72, 0.70));
+const lightPanelMat = new Material(new Vec3(1.0, 0.92, 0.72), 2.2, "ceiling");
+
+const woodMat = new Material(new Vec3(0.46, 0.28, 0.13));
+const darkWoodMat = new Material(new Vec3(0.23, 0.13, 0.07));
+const sofaMat = new Material(new Vec3(0.16, 0.38, 0.58));
+const cushionMat = new Material(new Vec3(0.90, 0.72, 0.42));
+const rugMat = new Material(new Vec3(0.55, 0.18, 0.22));
+const plantMat = new Material(new Vec3(0.12, 0.50, 0.18));
+const potMat = new Material(new Vec3(0.50, 0.28, 0.16));
+const lampGlowMat = new Material(new Vec3(1.0, 0.82, 0.48), 2.8, "lamp");
+const screenFrameMat = new Material(new Vec3(0.23, 0.13, 0.07));
+const screenMat = new Material(new Vec3(0.08, 0.09, 0.11));
+
+function quad(a, b, c, d, mat) {
+  tris.push(new Triangle(a, b, c, mat));
+  tris.push(new Triangle(a, c, d, mat));
+}
+
+function box(min, max, mat) {
+  const x0 = min.x, y0 = min.y, z0 = min.z;
+  const x1 = max.x, y1 = max.y, z1 = max.z;
+
+  const p000 = new Vec3(x0, y0, z0);
+  const p001 = new Vec3(x0, y0, z1);
+  const p010 = new Vec3(x0, y1, z0);
+  const p011 = new Vec3(x0, y1, z1);
+  const p100 = new Vec3(x1, y0, z0);
+  const p101 = new Vec3(x1, y0, z1);
+  const p110 = new Vec3(x1, y1, z0);
+  const p111 = new Vec3(x1, y1, z1);
+
+  quad(p001, p101, p111, p011, mat);
+  quad(p100, p000, p010, p110, mat);
+  quad(p000, p001, p011, p010, mat);
+  quad(p101, p100, p110, p111, mat);
+  quad(p010, p011, p111, p110, mat);
+  quad(p000, p100, p101, p001, mat);
+}
+
+function buildRoom() {
+  const x0 = -2.5, x1 = 2.5;
+  const y0 = -1.5, y1 = 2.0;
+  const z0 = 1.0, z1 = 6.0;
+
+  quad(new Vec3(x0, y0, z0), new Vec3(x1, y0, z0), new Vec3(x1, y0, z1), new Vec3(x0, y0, z1), floorMat);
+  quad(new Vec3(x0, y1, z1), new Vec3(x1, y1, z1), new Vec3(x1, y1, z0), new Vec3(x0, y1, z0), ceilingMat);
+  quad(new Vec3(x0, y0, z1), new Vec3(x1, y0, z1), new Vec3(x1, y1, z1), new Vec3(x0, y1, z1), whiteWall);
+  quad(new Vec3(x0, y0, z0), new Vec3(x0, y0, z1), new Vec3(x0, y1, z1), new Vec3(x0, y1, z0), redWall);
+  quad(new Vec3(x1, y0, z1), new Vec3(x1, y0, z0), new Vec3(x1, y1, z0), new Vec3(x1, y1, z1), blueWall);
+  quad(new Vec3(-0.65, 1.95, 3.0), new Vec3(0.65, 1.95, 3.0), new Vec3(0.65, 1.95, 4.0), new Vec3(-0.65, 1.95, 4.0), lightPanelMat);
+}
+
+function buildFurniture() {
+  box(new Vec3(-1.65, -1.48, 3.45), new Vec3(1.65, -1.42, 4.85), rugMat);
+
+  box(new Vec3(-1.75, -1.15, 4.55), new Vec3(1.75, -0.70, 5.20), sofaMat);
+  box(new Vec3(-1.75, -0.70, 4.95), new Vec3(1.75, 0.20, 5.20), sofaMat);
+  box(new Vec3(-1.95, -1.15, 4.55), new Vec3(-1.70, -0.45, 5.20), sofaMat);
+  box(new Vec3(1.70, -1.15, 4.55), new Vec3(1.95, -0.45, 5.20), sofaMat);
+
+  box(new Vec3(-1.30, -0.65, 4.35), new Vec3(-0.35, -0.18, 4.55), cushionMat);
+  box(new Vec3(0.35, -0.65, 4.35), new Vec3(1.30, -0.18, 4.55), cushionMat);
+
+  box(new Vec3(-0.75, -1.18, 2.75), new Vec3(0.75, -0.95, 3.55), woodMat);
+  box(new Vec3(-0.65, -1.50, 2.85), new Vec3(-0.50, -1.18, 3.00), darkWoodMat);
+  box(new Vec3(0.50, -1.50, 2.85), new Vec3(0.65, -1.18, 3.00), darkWoodMat);
+  box(new Vec3(-0.65, -1.50, 3.30), new Vec3(-0.50, -1.18, 3.45), darkWoodMat);
+  box(new Vec3(0.50, -1.50, 3.30), new Vec3(0.65, -1.18, 3.45), darkWoodMat);
+
+  box(new Vec3(-2.10, -1.50, 2.05), new Vec3(-1.40, -0.95, 2.45), woodMat);
+  box(new Vec3(-2.05, -0.95, 2.10), new Vec3(-1.45, -0.25, 2.40), woodMat);
+
+  box(new Vec3(1.35, -1.50, 2.00), new Vec3(1.70, -0.25, 2.35), potMat);
+  box(new Vec3(1.28, -0.25, 1.95), new Vec3(1.77, 0.10, 2.40), plantMat);
+  box(new Vec3(1.43, 0.05, 2.05), new Vec3(1.62, 0.65, 2.30), plantMat);
+
+  box(new Vec3(-2.20, -1.50, 3.95), new Vec3(-2.05, 0.65, 4.10), darkWoodMat);
+  box(new Vec3(-2.35, 0.65, 3.75), new Vec3(-1.90, 1.05, 4.30), lampGlowMat);
+
+  box(new Vec3(-0.85, 0.35, 5.95), new Vec3(0.85, 1.15, 5.98), screenFrameMat);
+  box(new Vec3(-0.75, 0.45, 5.92), new Vec3(0.75, 1.05, 5.95), screenMat);
+}
+
+buildRoom();
+buildFurniture();
+
+const sceneLights = [
+  {
+    id: "ceiling",
+    position: new Vec3(0.0, 1.88, 3.5),
+    color: new Vec3(1.0, 0.94, 0.82),
+    intensity: 3.5
+  },
+  {
+    id: "lamp",
+    position: new Vec3(-2.12, 0.88, 4.02),
+    color: new Vec3(1.0, 0.74, 0.42),
+    intensity: 4.4
+  }
+];
+
+const startCameraPos = new Vec3(0.0, 0.55, -2.25);
+const startYaw = 0;
+const startPitch = -0.09;
+
+let cameraPos = new Vec3(startCameraPos.x, startCameraPos.y, startCameraPos.z);
+let cameraYaw = startYaw;
+let cameraPitch = startPitch;
+let useDemoCamera = true;
+let demoPlaying = true;
+let demoTime = 0;
+let needsRender = true;
+const demoDuration = 14.0;
+const demoPath = [
+  { time: 0.00, pos: new Vec3(0.00, 0.60, -2.20), target: new Vec3(0.00, -0.15, 3.25) },
+  { time: 0.14, pos: new Vec3(-1.55, 0.70, 1.35), target: new Vec3(-0.10, -0.95, 3.00) },
+  { time: 0.28, pos: new Vec3(-1.95, 0.95, 2.85), target: new Vec3(0.35, -0.90, 3.30) },
+  { time: 0.42, pos: new Vec3(-0.45, 0.30, 2.15), target: new Vec3(0.15, -1.05, 3.10) },
+  { time: 0.56, pos: new Vec3(1.50, 0.75, 2.15), target: new Vec3(0.25, -0.90, 4.15) },
+  { time: 0.70, pos: new Vec3(1.55, 1.25, 4.45), target: new Vec3(-0.35, -0.35, 3.25) },
+  { time: 0.82, pos: new Vec3(-1.55, 1.00, 4.80), target: new Vec3(-2.10, 0.70, 4.00) },
+  { time: 0.92, pos: new Vec3(-0.20, 1.15, 5.15), target: new Vec3(0.00, -0.45, 3.25) },
+  { time: 1.00, pos: new Vec3(0.00, 0.60, -2.20), target: new Vec3(0.00, -0.15, 3.25) }
+];
+
+const currentLightLevels = { ceiling: 0, lamp: 0 };
+let currentLightLabel = "Lights off";
+const keys = new Set();
+let dragging = false;
+let lastMouseX = 0;
+let lastMouseY = 0;
+
+function clamp(value, min, max) { return Math.max(min, Math.min(max, value)); }
+function mix(a, b, t) { return a + (b - a) * t; }
+function mixVec3(a, b, t) { return new Vec3(mix(a.x, b.x, t), mix(a.y, b.y, t), mix(a.z, b.z, t)); }
+function smoothstep(t) { return t * t * (3 - 2 * t); }
+
+function sampleDemoCamera(normalizedTime) {
+  const t = ((normalizedTime % 1) + 1) % 1;
+  for (let i = 0; i < demoPath.length - 1; i++) {
+    const a = demoPath[i];
+    const b = demoPath[i + 1];
+    if (t >= a.time && t <= b.time) {
+      const local = smoothstep((t - a.time) / (b.time - a.time));
+      return {
+        pos: mixVec3(a.pos, b.pos, local),
+        target: mixVec3(a.target, b.target, local)
+      };
+    }
+  }
+  return demoPath[0];
+}
+
+function lookAt(target) {
+  const dir = target.sub(cameraPos).normalize();
+  cameraYaw = Math.atan2(dir.x, dir.z);
+  cameraPitch = Math.asin(clamp(dir.y, -1, 1));
+}
+
+function setDemoCamera() {
+  const sample = sampleDemoCamera(demoTime / demoDuration);
+  cameraPos = sample.pos;
+  lookAt(sample.target);
+  needsRender = true;
+}
+
+function evaluateLighting(timeSeconds) {
+  const t = ((timeSeconds % demoDuration) + demoDuration) % demoDuration;
+  let ceiling = 0;
+  let lamp = 0;
+  let label = "Lights off";
+
+  if (t < 2.0) {
+    ceiling = 0;
+    lamp = 0;
+    label = "Lights off";
+  } else if (t < 5.0) {
+    const u = smoothstep((t - 2.0) / 3.0);
+    ceiling = u;
+    lamp = 0;
+    label = "Ceiling light brightening";
+  } else if (t < 7.0) {
+    ceiling = 1.0;
+    lamp = 0;
+    label = "Ceiling light fully on";
+  } else if (t < 9.0) {
+    const u = smoothstep((t - 7.0) / 2.0);
+    ceiling = mix(1.0, 0.25, u);
+    lamp = mix(0.0, 1.0, u);
+    label = "Ceiling dimming, floor lamp brightening";
+  } else if (t < 11.0) {
+    const u = smoothstep((t - 9.0) / 2.0);
+    ceiling = mix(0.25, 0.85, u);
+    lamp = 1.0;
+    label = "Mixed lighting brightening";
+  } else if (t < 13.0) {
+    const u = smoothstep((t - 11.0) / 2.0);
+    ceiling = mix(0.85, 0.0, u);
+    lamp = mix(1.0, 0.0, u);
+    label = "Progressive fade to black";
+  } else {
+    ceiling = 0.0;
+    lamp = 0.0;
+    label = "Lights off";
+  }
+
+  currentLightLevels.ceiling = clamp(ceiling, 0, 1);
+  currentLightLevels.lamp = clamp(lamp, 0, 1);
+  currentLightLabel = label;
+}
+
+function getCameraBasis() {
+  const cameraDir = new Vec3(
+    Math.sin(cameraYaw) * Math.cos(cameraPitch),
+    Math.sin(cameraPitch),
+    Math.cos(cameraYaw) * Math.cos(cameraPitch)
+  ).normalize();
+
+  const worldUp = new Vec3(0, 1, 0);
+  const right = worldUp.cross(cameraDir).normalize();
+  const cameraUp = cameraDir.cross(right).normalize();
+  return { cameraDir, right, cameraUp };
+}
+
+function resetManualCamera() {
+  useDemoCamera = false;
+  cameraPos = new Vec3(startCameraPos.x, startCameraPos.y, startCameraPos.z);
+  cameraYaw = startYaw;
+  cameraPitch = startPitch;
+  needsRender = true;
+  updateStatus();
+}
+
+function intersectScene(ray) {
+  let closest = null;
+  for (const tri of tris) {
+    const hit = tri.intersect(ray);
+    if (hit && (!closest || hit.t < closest.t)) closest = hit;
+  }
+  return closest;
+}
+
+function getLightLevel(id) {
+  return currentLightLevels[id] ?? 1;
+}
+
+function trace(ray) {
+  const hit = intersectScene(ray);
+  if (!hit) return new Vec3(0.01, 0.012, 0.016);
+
+  const totalLightBlend = currentLightLevels.ceiling * 0.7 + currentLightLevels.lamp * 0.5;
+  const ambientStrength = 0.015 + 0.055 * totalLightBlend;
+  let color = hit.material.color.mul(ambientStrength);
+
+  for (const light of sceneLights) {
+    const level = getLightLevel(light.id);
+    if (level <= 0.001) continue;
+
+    const toLight = light.position.sub(hit.point);
+    const lightDistance = toLight.length();
+    const lightDir = toLight.normalize();
+    const shadowRay = new Ray(hit.point.add(hit.normal.mul(0.002)), lightDir);
+    const shadowHit = intersectScene(shadowRay);
+    let shadow = 1.0;
+
+    if (shadowHit && shadowHit.t < lightDistance) {
+      shadow = 0.18;
+    }
+
+    const diffuse = Math.max(0, hit.normal.dot(lightDir));
+    const attenuation = 1.0 / (1.0 + 0.11 * lightDistance * lightDistance);
+    const strength = light.intensity * level * diffuse * attenuation * shadow;
+    const contribution = hit.material.color.mulVec(light.color).mul(strength);
+    color = color.add(contribution);
+  }
+
+  if (hit.material.emission > 0) {
+    const emissionScale = hit.material.lightId ? getLightLevel(hit.material.lightId) : 1;
+    const emission = hit.material.color.mul(hit.material.emission * emissionScale);
+    color = color.add(emission);
+  }
+
+  return color;
+}
+
+function render() {
+  const aspect = width / height;
+  const fov = Math.tan((72 * Math.PI / 180) / 2);
+  const { cameraDir, right, cameraUp } = getCameraBasis();
+
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      const u = (2 * (x + 0.5) / width - 1) * aspect * fov;
+      const v = (1 - 2 * (y + 0.5) / height) * fov;
+      const direction = cameraDir.add(right.mul(u)).add(cameraUp.mul(v)).normalize();
+      const ray = new Ray(cameraPos, direction);
+      let color = trace(ray);
+
+      color = new Vec3(
+        Math.pow(Math.min(1, Math.max(0, color.x)), 1 / 2.2),
+        Math.pow(Math.min(1, Math.max(0, color.y)), 1 / 2.2),
+        Math.pow(Math.min(1, Math.max(0, color.z)), 1 / 2.2)
+      );
+
+      const index = (y * width + x) * 4;
+      pixels[index] = color.x * 255;
+      pixels[index + 1] = color.y * 255;
+      pixels[index + 2] = color.z * 255;
+      pixels[index + 3] = 255;
+    }
+  }
+
+  ctx.putImageData(imageData, 0, 0);
+}
+
+function applyRenderScale(scale) {
+  renderScale = scale;
+  scaleSelect.value = String(scale);
+  resize();
+  updateStatus();
+}
+
+function stepRenderScale(direction) {
+  let idx = allowedScales.findIndex(v => Math.abs(v - renderScale) < 0.001);
+  if (idx === -1) idx = 2;
+  idx = clamp(idx + direction, 0, allowedScales.length - 1);
+  applyRenderScale(allowedScales[idx]);
+}
+
+function resize() {
+  const displayWidth = window.innerWidth;
+  const displayHeight = window.innerHeight;
+  width = Math.max(1, Math.round(displayWidth * renderScale));
+  height = Math.max(1, Math.round(displayHeight * renderScale));
+
+  canvas.width = width;
+  canvas.height = height;
+  canvas.style.width = displayWidth + "px";
+  canvas.style.height = displayHeight + "px";
+
+  imageData = ctx.createImageData(width, height);
+  pixels = imageData.data;
+  needsRender = true;
+}
+
+function updateDemo(deltaSeconds) {
+  if (!demoPlaying) return;
+  demoTime += deltaSeconds;
+  if (demoTime >= demoDuration) demoTime -= demoDuration;
+  evaluateLighting(demoTime);
+  if (useDemoCamera) setDemoCamera();
+  needsRender = true;
+}
+
+function updateManualCamera(deltaSeconds) {
+  if (useDemoCamera || keys.size === 0) return;
+
+  const { cameraDir, right } = getCameraBasis();
+  const speed = 2.6;
+  let move = new Vec3(0, 0, 0);
+
+  if (keys.has("w")) move = move.add(cameraDir);
+  if (keys.has("s")) move = move.sub(cameraDir);
+  if (keys.has("d")) move = move.add(right);
+  if (keys.has("a")) move = move.sub(right);
+  if (keys.has("e")) move = move.add(new Vec3(0, 1, 0));
+  if (keys.has("q")) move = move.sub(new Vec3(0, 1, 0));
+
+  if (move.length() > 0) {
+    cameraPos = cameraPos.add(move.normalize().mul(speed * deltaSeconds));
+    needsRender = true;
+  }
+}
+
+function updateStatus() {
+  const cameraMode = useDemoCamera ? "Demo camera" : "Manual camera";
+  const playState = demoPlaying ? "playing" : "paused";
+  statusEl.textContent = `${cameraMode} | Demo ${playState} | time ${demoTime.toFixed(1)} / ${demoDuration.toFixed(0)}s | render ${Math.round(renderScale * 100)}% (${width}×${height})`;
+  lightingStatusEl.textContent = `Lighting: ${currentLightLabel}\nCeiling light ${(currentLightLevels.ceiling * 100).toFixed(0)}% | Floor lamp ${(currentLightLevels.lamp * 100).toFixed(0)}%`;
+  playPauseBtn.textContent = demoPlaying ? "Pause demo" : "Play demo";
+}
+
+window.addEventListener("resize", resize);
+window.addEventListener("keydown", (event) => {
+  const key = event.key.toLowerCase();
+
+  if (["w", "a", "s", "d", "q", "e", "r", "f", "t", "m", "p", "-", "=", "+"].includes(key)) {
+    event.preventDefault();
+  }
+
+  if (key === "f") {
+    demoPlaying = !demoPlaying;
+    updateStatus();
+    return;
+  }
+
+  if (key === "t") {
+    demoTime = 0;
+    evaluateLighting(demoTime);
+    if (useDemoCamera) setDemoCamera();
+    needsRender = true;
+    updateStatus();
+    return;
+  }
+
+  if (key === "m") {
+    useDemoCamera = false;
+    needsRender = true;
+    updateStatus();
+    return;
+  }
+
+  if (key === "p") {
+    useDemoCamera = true;
+    setDemoCamera();
+    updateStatus();
+    return;
+  }
+
+  if (key === "r") {
+    resetManualCamera();
+    return;
+  }
+
+  if (key === "-") {
+    stepRenderScale(-1);
+    return;
+  }
+
+  if (key === "=" || key === "+") {
+    stepRenderScale(1);
+    return;
+  }
+
+  if (["w", "a", "s", "d", "q", "e"].includes(key)) {
+    useDemoCamera = false;
+    keys.add(key);
+    updateStatus();
+  }
+});
+
+window.addEventListener("keyup", (event) => {
+  keys.delete(event.key.toLowerCase());
+});
+
+canvas.addEventListener("mousedown", (event) => {
+  useDemoCamera = false;
+  dragging = true;
+  lastMouseX = event.clientX;
+  lastMouseY = event.clientY;
+  updateStatus();
+});
+
+window.addEventListener("mouseup", () => {
+  dragging = false;
+});
+
+window.addEventListener("mousemove", (event) => {
+  if (!dragging) return;
+  const sensitivity = 0.004;
+  const dx = event.clientX - lastMouseX;
+  const dy = event.clientY - lastMouseY;
+  lastMouseX = event.clientX;
+  lastMouseY = event.clientY;
+
+  cameraYaw -= dx * sensitivity;
+  cameraPitch = clamp(cameraPitch + dy * sensitivity, -1.35, 1.35);
+  needsRender = true;
+});
+
+playPauseBtn.addEventListener("click", () => {
+  demoPlaying = !demoPlaying;
+  updateStatus();
+});
+
+restartBtn.addEventListener("click", () => {
+  demoTime = 0;
+  evaluateLighting(demoTime);
+  if (useDemoCamera) setDemoCamera();
+  needsRender = true;
+  updateStatus();
+});
+
+manualBtn.addEventListener("click", () => {
+  useDemoCamera = false;
+  needsRender = true;
+  updateStatus();
+});
+
+demoBtn.addEventListener("click", () => {
+  useDemoCamera = true;
+  setDemoCamera();
+  updateStatus();
+});
+
+scaleSelect.addEventListener("change", () => {
+  applyRenderScale(parseFloat(scaleSelect.value));
+});
+
+let previousTime = performance.now();
+
+function animationLoop(now) {
+  const deltaSeconds = Math.min(0.05, (now - previousTime) / 1000);
+  previousTime = now;
+
+  updateDemo(deltaSeconds);
+  updateManualCamera(deltaSeconds);
+
+  if (needsRender) {
+    render();
+    needsRender = false;
+    updateStatus();
+  }
+
+  requestAnimationFrame(animationLoop);
+}
+
+resize();
+evaluateLighting(demoTime);
+setDemoCamera();
+updateStatus();
+requestAnimationFrame(animationLoop);
+</script>
+</body>
+</html>
